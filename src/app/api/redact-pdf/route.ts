@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { PDFDocument, rgb } from "pdf-lib";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { TextPosition } from "@/lib/pdf-extract";
 
 export async function POST(request: NextRequest) {
@@ -23,43 +23,51 @@ export async function POST(request: NextRequest) {
     const pdfBytes = await file.arrayBuffer();
     const pdfDoc = await PDFDocument.load(pdfBytes);
     const pages = pdfDoc.getPages();
+    const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+    const redactionLabel = "[retracted]";
 
-    // For each match, find overlapping text positions and draw black boxes
+    // For each match, find overlapping text positions and stamp a visible replacement.
     for (const match of matches) {
-      // Find all text positions that overlap with this match
       const overlapping = positions.filter(
         (pos) => pos.charStart < match.end && pos.charEnd > match.start
       );
+      const byPage = new Map<number, TextPosition[]>();
 
       for (const pos of overlapping) {
-        const page = pages[pos.pageIndex];
-        if (!page) continue;
+        byPage.set(pos.pageIndex, [...(byPage.get(pos.pageIndex) || []), pos]);
+      }
 
-        const pageHeight = page.getHeight();
+      for (const [pageIndex, pagePositions] of byPage.entries()) {
+        const page = pages[pageIndex];
+        if (!page || pagePositions.length === 0) continue;
 
-        // Calculate the portion of this text item that's redacted
-        const overlapStart = Math.max(match.start, pos.charStart);
-        const overlapEnd = Math.min(match.end, pos.charEnd);
-
-        // Calculate x offset for partial redaction
-        const fullText = pos.text;
-        const startInItem = overlapStart - pos.charStart;
-        const endInItem = overlapEnd - pos.charStart;
-
-        // Estimate character width (proportional)
-        const charWidth = pos.width / Math.max(fullText.length, 1);
-        const redactX = pos.x + startInItem * charWidth;
-        const redactWidth = (endInItem - startInItem) * charWidth;
-
-        // Draw black rectangle over the text
-        // PDF y-coordinate: text baseline, so box starts slightly below
         const padding = 2;
+        const left = Math.min(...pagePositions.map((pos) => pos.x)) - padding;
+        const bottom = Math.min(...pagePositions.map((pos) => pos.y)) - padding;
+        const right =
+          Math.max(...pagePositions.map((pos) => pos.x + pos.width)) + padding;
+        const top =
+          Math.max(...pagePositions.map((pos) => pos.y + pos.height)) + padding;
+        const width = Math.max(1, right - left);
+        const height = Math.max(1, top - bottom);
+        const fontSize = Math.max(7, Math.min(10, height * 0.55));
+
         page.drawRectangle({
-          x: redactX - padding,
-          y: pos.y - padding,
-          width: redactWidth + padding * 2,
-          height: pos.height + padding * 2,
-          color: rgb(0, 0, 0),
+          x: left,
+          y: bottom,
+          width,
+          height,
+          color: rgb(1, 0.97, 0.92),
+          borderColor: rgb(0.95, 0.45, 0.1),
+          borderWidth: 0.5,
+        });
+        page.drawText(redactionLabel, {
+          x: left + 2,
+          y: bottom + Math.max(1, (height - fontSize) / 2),
+          size: fontSize,
+          font,
+          color: rgb(0.45, 0.16, 0.07),
+          maxWidth: Math.max(1, width - 4),
         });
       }
     }

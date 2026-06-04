@@ -16,11 +16,17 @@ function getPreferredTheme(): ThemeMode {
 }
 
 export function ThemeToggle() {
-  const [theme, setTheme] = useState<ThemeMode>(() => getPreferredTheme());
+  const [theme, setTheme] = useState<ThemeMode>("dark");
+  const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-  }, [theme]);
+    const preferredTheme = getPreferredTheme();
+    document.documentElement.dataset.theme = preferredTheme;
+    queueMicrotask(() => {
+      setTheme(preferredTheme);
+      setMounted(true);
+    });
+  }, []);
 
   const toggleTheme = () => {
     const nextTheme = theme === "dark" ? "light" : "dark";
@@ -35,13 +41,17 @@ export function ThemeToggle() {
       onClick={toggleTheme}
       className="theme-toggle inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium"
       aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+      suppressHydrationWarning
     >
-      <span aria-hidden="true">{theme === "dark" ? "Light" : "Dark"}</span>
+      <span aria-hidden="true" suppressHydrationWarning>
+        {mounted ? (theme === "dark" ? "Light" : "Dark") : "Light"}
+      </span>
       <span
         aria-hidden="true"
         className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-[color:var(--surface-muted)] text-[color:var(--foreground)]"
+        suppressHydrationWarning
       >
-        {theme === "dark" ? "◐" : "◑"}
+        {mounted ? (theme === "dark" ? "◐" : "◑") : "◐"}
       </span>
     </button>
   );

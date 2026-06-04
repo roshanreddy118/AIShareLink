@@ -15,6 +15,7 @@ interface PIIMatch {
   end: number;
   label: string;
   enabled?: boolean;
+  imageLineIndex?: number;
 }
 
 export interface ImageWordBox {
@@ -25,6 +26,7 @@ export interface ImageWordBox {
   height: number;
   charStart: number;
   charEnd: number;
+  lineIndex?: number;
 }
 
 export interface ScanResult {

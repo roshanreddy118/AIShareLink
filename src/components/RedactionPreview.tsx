@@ -14,6 +14,7 @@ export function RedactionPreview({
   onShareComplete,
   onBack,
 }: RedactionPreviewProps) {
+  const redactionLabel = "[retracted]";
   const [matches, setMatches] = useState(scanResult.matches);
   const [isSharing, setIsSharing] = useState(false);
   const [expiryHours, setExpiryHours] = useState(24);
@@ -38,10 +39,22 @@ export function RedactionPreview({
       .sort((a, b) => b.start - a.start);
 
     for (const match of enabledMatches) {
-      const replacement = "█".repeat(match.value.length);
-      text = text.slice(0, match.start) + replacement + text.slice(match.end);
+      text = text.slice(0, match.start) + redactionLabel + text.slice(match.end);
     }
     return text;
+  };
+
+  const getRedactedItems = (enabledMatches: typeof matches) => {
+    const counts = new Map<string, number>();
+
+    for (const match of enabledMatches) {
+      const label = match.label.replace(/^\uD83E\uDD16\s*/, "");
+      counts.set(label, (counts.get(label) || 0) + 1);
+    }
+
+    return Array.from(counts.entries()).map(([label, count]) =>
+      count > 1 ? `${label}: ${count} redacted` : `${label}: redacted`
+    );
   };
 
   const getHighlightedText = () => {
@@ -72,25 +85,60 @@ export function RedactionPreview({
     return new Promise((resolve, reject) => {
       const img = new Image();
       img.onload = () => {
+        const maxOutputDimension = 1800;
+        const outputScale = Math.min(
+          1,
+          maxOutputDimension / Math.max(img.naturalWidth, img.naturalHeight)
+        );
         const canvas = document.createElement("canvas");
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
+        canvas.width = Math.max(1, Math.round(img.naturalWidth * outputScale));
+        canvas.height = Math.max(1, Math.round(img.naturalHeight * outputScale));
         const ctx = canvas.getContext("2d")!;
-        ctx.drawImage(img, 0, 0);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-        // Draw black rectangles over matched word positions
-        ctx.fillStyle = "#000000";
         for (const match of enabledMatches) {
-          // Find all word boxes that overlap with this match's character range
-          for (const box of positions) {
-            if (box.charEnd > match.start && box.charStart < match.end) {
-              ctx.fillRect(box.x - 2, box.y - 2, box.width + 4, box.height + 4);
-            }
-          }
+          const overlapping =
+            match.type === "screenshot_text" && match.imageLineIndex !== undefined
+              ? positions.filter((box) => box.lineIndex === match.imageLineIndex)
+              : positions.filter(
+                  (box) => box.charEnd > match.start && box.charStart < match.end
+                );
+          if (overlapping.length === 0) continue;
+
+          const left = Math.max(
+            0,
+            (Math.min(...overlapping.map((box) => box.x)) - 4) * outputScale
+          );
+          const top = Math.max(
+            0,
+            (Math.min(...overlapping.map((box) => box.y)) - 3) * outputScale
+          );
+          const right = Math.min(
+            canvas.width,
+            (Math.max(...overlapping.map((box) => box.x + box.width)) + 4) *
+              outputScale
+          );
+          const bottom = Math.min(
+            canvas.height,
+            (Math.max(...overlapping.map((box) => box.y + box.height)) + 3) *
+              outputScale
+          );
+          const width = Math.max(1, right - left);
+          const height = Math.max(1, bottom - top);
+          const fontSize = Math.max(10, Math.min(16, height * 0.72));
+
+          ctx.fillStyle = "#111827";
+          ctx.fillRect(left, top, width, height);
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 1;
+          ctx.strokeRect(left, top, width, height);
+          ctx.fillStyle = "#ffffff";
+          ctx.font = `600 ${fontSize}px Arial, sans-serif`;
+          ctx.textBaseline = "middle";
+          ctx.fillText(redactionLabel, left + 3, top + height / 2, Math.max(1, width - 6));
         }
 
-        // Export as PNG base64
-        const dataUrl = canvas.toDataURL("image/png");
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.86);
         const base64 = dataUrl.split(",")[1];
         resolve(base64);
       };
@@ -104,15 +152,16 @@ export function RedactionPreview({
     setShareError("");
     try {
       const enabledMatches = matches.filter((m) => m.enabled);
-      const redactedItems = enabledMatches.map((m) => `${m.label}: ${m.value.slice(0, 3)}***`);
+      const redactedItems = getRedactedItems(enabledMatches);
 
       let redactedContent: string;
 
       const isPdf = scanResult.fileType === "application/pdf" && scanResult.pdfPositions;
       const isImage = scanResult.fileType.startsWith("image/") && scanResult.imagePositions;
+      const sharedFileType = isImage ? "image/jpeg" : scanResult.fileType;
 
       if (isPdf) {
-        // Use the redact-pdf API to draw black boxes on the original PDF
+        // Use the redact-pdf API to stamp replacements on the original PDF
         const formData = new FormData();
         formData.append("file", scanResult.originalFile);
         formData.append("positions", JSON.stringify(scanResult.pdfPositions));
@@ -132,7 +181,7 @@ export function RedactionPreview({
         }
         redactedContent = redactData.redactedPdf;
       } else if (isImage) {
-        // Draw black boxes on the original image using Canvas
+        // Stamp replacement labels on the original image using Canvas.
         redactedContent = await redactImage(enabledMatches);
       } else {
         // For text files, use text-based redaction
@@ -145,7 +194,7 @@ export function RedactionPreview({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           fileName: scanResult.fileName,
-          fileType: scanResult.fileType,
+          fileType: sharedFileType,
           redactedContent,
           redactedItems,
           expiresIn: expiryHours * 60 * 60 * 1000,
@@ -174,9 +223,9 @@ export function RedactionPreview({
   const disabledCount = matches.length - enabledCount;
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-        <div>
+    <div className="min-w-0 space-y-6 overflow-x-hidden">
+      <div className="flex min-w-0 flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+        <div className="min-w-0">
           <p className="text-label text-xs uppercase tracking-[0.24em]">
             Review
           </p>
@@ -184,7 +233,8 @@ export function RedactionPreview({
             Confirm every redaction before the document leaves this workspace.
           </h2>
           <p className="text-soft mt-3 text-sm">
-            Reviewing <span className="text-strong">{scanResult.fileName}</span>
+            Reviewing{" "}
+            <span className="text-strong break-words">{scanResult.fileName}</span>
           </p>
         </div>
         <button
@@ -204,7 +254,7 @@ export function RedactionPreview({
         <div className="data-card">
           <p className="text-label text-xs uppercase tracking-[0.2em]">Selected</p>
           <p className="text-success mt-3 text-3xl font-semibold">{enabledCount}</p>
-          <p className="text-soft mt-1 text-sm">Items queued for blackout</p>
+          <p className="text-soft mt-1 text-sm">Items queued for replacement</p>
         </div>
         <div className="data-card">
           <p className="text-label text-xs uppercase tracking-[0.2em]">Ignored</p>
@@ -213,8 +263,8 @@ export function RedactionPreview({
         </div>
       </div>
 
-      <div className="grid gap-5 xl:grid-cols-[0.95fr_1.25fr]">
-        <section className="panel-soft rounded-[1.6rem] p-5">
+      <div className="grid min-w-0 gap-5 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.25fr)]">
+        <section className="panel-soft min-w-0 rounded-[1.6rem] p-5">
           <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <h3 className="text-strong text-lg font-medium">Detection list</h3>
@@ -238,11 +288,11 @@ export function RedactionPreview({
             </div>
           </div>
 
-          <div className="scroll-panel max-h-[30rem] space-y-2 overflow-y-auto pr-1">
+          <div className="scroll-panel max-h-[30rem] min-w-0 space-y-2 overflow-y-auto overflow-x-hidden pr-1">
             {matches.map((match, i) => (
               <label
                 key={i}
-                className={`flex cursor-pointer gap-3 rounded-2xl border p-3 ${
+                className={`flex min-w-0 cursor-pointer gap-3 rounded-2xl border p-3 ${
                   match.enabled
                     ? "surface-danger"
                     : "border-[color:var(--surface-border)] bg-[color:var(--surface-muted)]"
@@ -252,11 +302,11 @@ export function RedactionPreview({
                   type="checkbox"
                   checked={match.enabled}
                   onChange={() => toggleMatch(i)}
-                  className="mt-1 h-4 w-4 rounded accent-emerald-400"
+                  className="mt-1 h-4 w-4 shrink-0 rounded accent-emerald-400"
                 />
                 <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="metric-pill rounded-full px-2.5 py-1 text-[11px] uppercase tracking-[0.18em]">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <span className="metric-pill max-w-full break-words rounded-full px-2.5 py-1 text-[11px] uppercase tracking-[0.18em]">
                       {match.label}
                     </span>
                     <span
@@ -267,7 +317,7 @@ export function RedactionPreview({
                       {match.enabled ? "Will redact" : "Visible"}
                     </span>
                   </div>
-                  <p className="text-strong mt-2 truncate font-mono text-sm">
+                  <p className="text-strong mt-2 max-h-20 overflow-y-auto break-words font-mono text-sm leading-6">
                     {match.value}
                   </p>
                 </div>
@@ -276,24 +326,24 @@ export function RedactionPreview({
           </div>
         </section>
 
-        <section className="space-y-5">
-          <div className="panel-soft rounded-[1.6rem] p-5">
+        <section className="min-w-0 space-y-5">
+          <div className="panel-soft min-w-0 rounded-[1.6rem] p-5">
             <h3 className="text-strong text-lg font-medium">Document preview</h3>
             <p className="text-soft mt-1 text-sm">
-              Highlighted segments show what will be blacked out in the shared copy.
+              Highlighted segments show what will be replaced in the shared copy.
             </p>
-            <div className="preview-surface scroll-panel mt-4 max-h-[22rem] overflow-y-auto rounded-[1.25rem] p-4 font-mono text-sm leading-relaxed whitespace-pre-wrap break-all">
+            <div className="preview-surface scroll-panel mt-4 max-h-[22rem] min-w-0 overflow-y-auto overflow-x-hidden rounded-[1.25rem] p-4 font-mono text-sm leading-relaxed whitespace-pre-wrap break-words">
               {getHighlightedText().map((part, i) =>
                 part.isRedacted ? (
                   <span
                     key={i}
-                    className="surface-danger text-danger inline break-all rounded px-0.5"
+                    className="surface-danger text-danger inline break-words rounded px-0.5"
                     title="Will be redacted"
                   >
                     {part.text}
                   </span>
                 ) : (
-                  <span key={i} className="text-soft break-all">
+                  <span key={i} className="text-soft break-words">
                     {part.text}
                   </span>
                 )
@@ -301,7 +351,7 @@ export function RedactionPreview({
             </div>
           </div>
 
-          <div className="panel-soft rounded-[1.6rem] p-5">
+          <div className="panel-soft min-w-0 rounded-[1.6rem] p-5">
             <h3 className="text-strong text-lg font-medium">Share settings</h3>
             <div className="mt-4 grid gap-4 md:grid-cols-3">
               <div>
@@ -360,7 +410,7 @@ export function RedactionPreview({
               disabled={isSharing || enabledCount === 0}
               className="spot-button primary-button mt-5 w-full rounded-[1.25rem] px-4 py-3.5 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50"
             >
-              <span>
+              <span className="block break-words">
                 {isSharing
                   ? "Generating secure link..."
                   : `Generate safe share link (${enabledCount} items redacted)`}

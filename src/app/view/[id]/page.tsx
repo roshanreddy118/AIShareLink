@@ -151,7 +151,9 @@ export default function ViewPage({ params }: { params: Promise<{ id: string }> }
   const isImage = data.fileType.startsWith("image/");
   const content = (isPdf || isImage) ? "" : getDecodedContent();
   const pdfDataUrl = isPdf ? `data:application/pdf;base64,${data.redactedContent}` : "";
-  const imageDataUrl = isImage ? `data:image/png;base64,${data.redactedContent}` : "";
+  const imageMimeType = isImage ? data.fileType || "image/jpeg" : "";
+  const imageExtension = imageMimeType === "image/png" ? "png" : "jpg";
+  const imageDataUrl = isImage ? `data:${imageMimeType};base64,${data.redactedContent}` : "";
   const referenceTime = currentTime || data.createdAt;
   const timeLeft = Math.max(0, data.expiresAt - referenceTime);
   const hoursLeft = Math.floor(timeLeft / (1000 * 60 * 60));
@@ -261,11 +263,11 @@ export default function ViewPage({ params }: { params: Promise<{ id: string }> }
                 for (let i = 0; i < binaryString.length; i++) {
                   bytes[i] = binaryString.charCodeAt(i);
                 }
-                const blob = new Blob([bytes], { type: "image/png" });
+                const blob = new Blob([bytes], { type: imageMimeType });
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement("a");
                 a.href = url;
-                a.download = `redacted-${baseName}.png`;
+                a.download = `redacted-${baseName}.${imageExtension}`;
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);

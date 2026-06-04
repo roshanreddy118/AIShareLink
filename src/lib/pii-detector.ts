@@ -151,7 +151,7 @@ const PII_PATTERNS: { type: string; label: string; regex: RegExp }[] = [
   {
     type: "email",
     label: "Email Address",
-    regex: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g,
+    regex: /\b[a-zA-Z0-9](?:[a-zA-Z0-9._%+-]{0,62}[a-zA-Z0-9])?@(?:[a-zA-Z](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[A-Za-z]{2,}\b/g,
   },
 
   // === DATE OF BIRTH ===

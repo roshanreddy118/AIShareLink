@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useRef } from "react";
-import { ScanResult, ImageWordBox } from "@/app/page";
+import { useRef, useState } from "react";
+import { ImageWordBox, ScanResult } from "@/app/page";
 
 interface FileUploadProps {
   onScanComplete: (result: ScanResult) => void;
@@ -12,7 +12,8 @@ export function FileUpload({ onScanComplete }: FileUploadProps) {
   const [isProcessing, setIsProcessing] = useState(false);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const documentInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
 
   const processFile = async (file: File) => {
     setIsProcessing(true);
@@ -23,18 +24,27 @@ export function FileUpload({ onScanComplete }: FileUploadProps) {
       const formData = new FormData();
       formData.append("file", file);
 
-      // For images, run OCR client-side first
       let imageWordBoxes: ImageWordBox[] | undefined;
+      let imageText: string | undefined;
       if (file.type.startsWith("image/")) {
-        setStatus("Preparing image for OCR...");
-        const optimized = await resizeForOCR(file);
-        setStatus("Running OCR on image...");
-        const ocrResult = await runClientOCR(optimized);
+        setStatus("Preparing image scan...");
+        const optimized = await resizeForImageScan(file);
+        setStatus("Reading text in image...");
+        const ocrResult = await runClientOCR(
+          optimized.blob,
+          optimized.scaleX,
+          optimized.scaleY
+        );
         formData.append("extractedText", ocrResult.text);
+        imageText = ocrResult.text;
         imageWordBoxes = ocrResult.wordBoxes;
       }
 
-      setStatus("Detecting PII patterns...");
+      setStatus(
+        file.type.startsWith("image/")
+          ? "Preparing screenshot redactions..."
+          : "Detecting PII patterns..."
+      );
       const response = await fetch("/api/scan", {
         method: "POST",
         body: formData,
@@ -46,12 +56,22 @@ export function FileUpload({ onScanComplete }: FileUploadProps) {
       }
 
       const data = await response.json();
+      const isImage = file.type.startsWith("image/");
+      const matches = isImage
+        ? buildImageMatches(imageWordBoxes || [], data.matches || [])
+        : data.matches;
+
+      if (isImage && imageText?.trim() && imageWordBoxes?.length === 0) {
+        throw new Error(
+          "Image text was detected, but no word positions were returned for redaction. Try a clearer screenshot or PDF export."
+        );
+      }
 
       onScanComplete({
         fileName: data.fileName,
         fileType: data.fileType,
         text: data.text,
-        matches: data.matches,
+        matches,
         originalFile: file,
         pdfPositions: data.pdfPositions,
         imagePositions: imageWordBoxes,
@@ -64,69 +84,187 @@ export function FileUpload({ onScanComplete }: FileUploadProps) {
     }
   };
 
-  const resizeForOCR = async (file: File): Promise<File | Blob> => {
-    const MAX_DIM = 2000;
+  const resizeForImageScan = async (
+    file: File
+  ): Promise<{ blob: File | Blob; scaleX: number; scaleY: number }> => {
+    const maxDimension = 2000;
+
     return new Promise((resolve) => {
       const img = new Image();
       img.onload = () => {
-        if (img.width <= MAX_DIM && img.height <= MAX_DIM) {
-          resolve(file);
+        if (img.width <= maxDimension && img.height <= maxDimension) {
+          resolve({ blob: file, scaleX: 1, scaleY: 1 });
           return;
         }
-        const scale = Math.min(MAX_DIM / img.width, MAX_DIM / img.height);
+
+        const scale = Math.min(maxDimension / img.width, maxDimension / img.height);
         const canvas = document.createElement("canvas");
         canvas.width = Math.round(img.width * scale);
         canvas.height = Math.round(img.height * scale);
         const ctx = canvas.getContext("2d")!;
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         canvas.toBlob(
-          (blob) => resolve(blob || file),
+          (blob) =>
+            resolve({
+              blob: blob || file,
+              scaleX: img.width / canvas.width,
+              scaleY: img.height / canvas.height,
+            }),
           "image/png"
         );
       };
-      img.onerror = () => resolve(file);
+      img.onerror = () => resolve({ blob: file, scaleX: 1, scaleY: 1 });
       img.src = URL.createObjectURL(file);
     });
   };
 
-  const runClientOCR = async (file: File | Blob): Promise<{ text: string; wordBoxes: ImageWordBox[] }> => {
+  const runClientOCR = async (
+    file: File | Blob,
+    scaleX: number,
+    scaleY: number
+  ): Promise<{ text: string; wordBoxes: ImageWordBox[] }> => {
     const Tesseract = await import("tesseract.js");
     const worker = await Tesseract.createWorker("eng", undefined, {
       logger: (m: { status: string; progress: number }) => {
         if (m.status === "recognizing text") {
-          setStatus(`OCR: ${Math.round(m.progress * 100)}% complete...`);
+          setStatus(`Image scan: ${Math.round(m.progress * 100)}% complete...`);
         } else if (m.status === "loading language traineddata") {
-          setStatus("Loading OCR model (first time may take a moment)...");
+          setStatus("Loading image text model...");
         }
       },
     });
-    const { data } = await worker.recognize(file);
+    const { data } = await worker.recognize(file, {}, { blocks: true });
     await worker.terminate();
 
-    // Build word-level bounding boxes with character offsets
     const wordBoxes: ImageWordBox[] = [];
     let charOffset = 0;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const pageData = data as any;
-    const lines = pageData.lines || [];
-    for (const line of lines) {
-      for (const word of line.words) {
-        const bbox = word.bbox;
+    const pageData = data as {
+      blocks?: Array<{
+        paragraphs?: Array<{
+          lines?: Array<{
+            words?: Array<OCRWord>;
+          }>;
+        }>;
+      }> | null;
+      lines?: Array<{
+        words?: Array<OCRWord>;
+      }>;
+      words?: Array<OCRWord>;
+    };
+    const recognizedLines: string[] = [];
+
+    getOCRLines(pageData).forEach((words, lineIndex) => {
+      const lineText: string[] = [];
+
+      for (const word of words) {
+        const text = word.text?.trim();
+        if (!text || !word.bbox) continue;
+
+        if (lineText.length > 0) {
+          charOffset += 1;
+        }
+
+        const charStart = charOffset;
+        const charEnd = charStart + text.length;
+        lineText.push(text);
         wordBoxes.push({
-          text: word.text,
-          x: bbox.x0,
-          y: bbox.y0,
-          width: bbox.x1 - bbox.x0,
-          height: bbox.y1 - bbox.y0,
-          charStart: charOffset,
-          charEnd: charOffset + word.text.length,
+          text,
+          x: word.bbox.x0 * scaleX,
+          y: word.bbox.y0 * scaleY,
+          width: (word.bbox.x1 - word.bbox.x0) * scaleX,
+          height: (word.bbox.y1 - word.bbox.y0) * scaleY,
+          charStart,
+          charEnd,
+          lineIndex,
         });
-        charOffset += word.text.length + 1; // +1 for space
+        charOffset = charEnd;
       }
-      // End of line adds a newline instead of space
+
+      if (lineText.length > 0) {
+        recognizedLines.push(lineText.join(" "));
+        charOffset += 1;
+      }
+    });
+
+    const text = recognizedLines.length > 0 ? recognizedLines.join("\n") : data.text;
+    return { text, wordBoxes };
+  };
+
+  type OCRWord = {
+    text?: string;
+    bbox?: { x0: number; y0: number; x1: number; y1: number };
+  };
+
+  const getOCRLines = (pageData: {
+    blocks?: Array<{
+      paragraphs?: Array<{
+        lines?: Array<{ words?: Array<OCRWord> }>;
+      }>;
+    }> | null;
+    lines?: Array<{ words?: Array<OCRWord> }>;
+    words?: Array<OCRWord>;
+  }): OCRWord[][] => {
+    const blockLines =
+      pageData.blocks?.flatMap((block) =>
+        block.paragraphs?.flatMap((paragraph) =>
+          paragraph.lines?.map((line) => line.words || []) || []
+        ) || []
+      ) || [];
+
+    if (blockLines.length > 0) return blockLines;
+
+    const directLines = pageData.lines?.map((line) => line.words || []) || [];
+    if (directLines.length > 0) return directLines;
+
+    return pageData.words?.length ? [pageData.words] : [];
+  };
+
+  const buildImageMatches = (
+    wordBoxes: ImageWordBox[],
+    detectedMatches: ScanResult["matches"]
+  ): ScanResult["matches"] => {
+    if (detectedMatches.length > 0) {
+      return detectedMatches.map((match) => {
+        const overlappingBoxes = wordBoxes.filter(
+          (box) => box.charEnd > match.start && box.charStart < match.end
+        );
+        const firstLineIndex = overlappingBoxes[0]?.lineIndex;
+        const sameLine =
+          firstLineIndex !== undefined &&
+          overlappingBoxes.every((box) => box.lineIndex === firstLineIndex);
+
+        return {
+          ...match,
+          imageLineIndex: sameLine ? firstLineIndex : undefined,
+        };
+      });
     }
 
-    return { text: data.text, wordBoxes };
+    const lineGroups = new Map<number, ImageWordBox[]>();
+
+    for (const box of wordBoxes) {
+      if (!box.text.trim()) continue;
+      const lineIndex = box.lineIndex ?? box.charStart;
+      lineGroups.set(lineIndex, [...(lineGroups.get(lineIndex) || []), box]);
+    }
+
+    return Array.from(lineGroups.entries())
+      .map(([lineIndex, lineBoxes], index) => {
+        const sortedBoxes = [...lineBoxes].sort((a, b) => a.charStart - b.charStart);
+        const value = sortedBoxes.map((box) => box.text).join(" ").trim();
+        const start = Math.min(...sortedBoxes.map((box) => box.charStart));
+        const end = Math.max(...sortedBoxes.map((box) => box.charEnd));
+
+        return {
+          type: "screenshot_text",
+          value,
+          start,
+          end,
+          label: `Screenshot text line ${index + 1}`,
+          imageLineIndex: lineIndex,
+        };
+      })
+      .filter((match) => match.value.length > 0);
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -138,10 +276,9 @@ export function FileUpload({ onScanComplete }: FileUploadProps) {
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = "";
     if (file) processFile(file);
   };
-
-  const acceptedTypes = ".pdf,.png,.jpg,.jpeg,.webp,.txt";
 
   return (
     <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
@@ -171,12 +308,18 @@ export function FileUpload({ onScanComplete }: FileUploadProps) {
           }}
           onDragLeave={() => setIsDragging(false)}
           onDrop={handleDrop}
-          onClick={() => fileInputRef.current?.click()}
         >
           <input
-            ref={fileInputRef}
+            ref={documentInputRef}
             type="file"
-            accept={acceptedTypes}
+            accept=".pdf,.txt,application/pdf,text/plain"
+            onChange={handleFileSelect}
+            className="hidden"
+          />
+          <input
+            ref={imageInputRef}
+            type="file"
+            accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"
             onChange={handleFileSelect}
             className="hidden"
           />
@@ -215,11 +358,33 @@ export function FileUpload({ onScanComplete }: FileUploadProps) {
               </div>
               <div>
                 <p className="text-strong text-2xl font-medium">
-                  Drop your file here or click to browse
+                  Drop a file here or choose one below
                 </p>
                 <p className="text-soft mt-3 text-sm">
                   Supports PDF, PNG, JPG, WebP, and plain text.
                 </p>
+              </div>
+              <div className="flex flex-col justify-center gap-3 sm:flex-row">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    documentInputRef.current?.click();
+                  }}
+                  className="spot-button primary-button rounded-[1.1rem] px-4 py-3 text-sm font-semibold"
+                >
+                  <span>Choose PDF or text file</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    imageInputRef.current?.click();
+                  }}
+                  className="outline-button rounded-[1.1rem] px-4 py-3 text-sm font-semibold"
+                >
+                  Choose image
+                </button>
               </div>
               <div className="text-dim flex flex-wrap items-center justify-center gap-3 text-xs">
                 <span className="metric-pill rounded-full px-3 py-1.5">
@@ -229,7 +394,7 @@ export function FileUpload({ onScanComplete }: FileUploadProps) {
                   In-memory processing
                 </span>
                 <span className="metric-pill rounded-full px-3 py-1.5">
-                  OCR for images
+                  Broad screenshot coverage
                 </span>
               </div>
             </div>
@@ -270,8 +435,8 @@ export function FileUpload({ onScanComplete }: FileUploadProps) {
             <p className="text-strong mt-2 text-sm">Structured documents with position-aware redaction.</p>
           </div>
           <div className="panel-soft rounded-2xl p-4">
-            <p className="text-label text-xs uppercase tracking-[0.2em]">Image OCR</p>
-            <p className="text-strong mt-2 text-sm">Extract text from screenshots and scans before masking sensitive content.</p>
+            <p className="text-label text-xs uppercase tracking-[0.2em]">Image</p>
+            <p className="text-strong mt-2 text-sm">Cover readable screenshot text in the redacted copy.</p>
           </div>
           <div className="panel-soft rounded-2xl p-4">
             <p className="text-label text-xs uppercase tracking-[0.2em]">Text</p>

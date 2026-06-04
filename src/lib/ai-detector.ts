@@ -51,6 +51,7 @@ Do NOT flag:
 - Company names, toll-free numbers, law section numbers
 - Generic policy type names ("Family Health Optima")
 - Field labels without values ("Policy Holder Name :")
+- Countries, regions, continents, or geopolitical areas unless they are part of a street address with a person-specific identifier
 
 IMPORTANT: Find EVERY occurrence of each name in the text.
 
@@ -93,6 +94,7 @@ Respond ONLY with JSON array. Each item:
       if (detection.value.length > 80) continue;
       // Skip empty values
       if (!detection.value.trim()) continue;
+      if (isNonPersonalGeography(detection)) continue;
 
       const index = text.indexOf(detection.value);
       if (index !== -1) {
@@ -124,4 +126,31 @@ Respond ONLY with JSON array. Each item:
     console.warn("AI PII detection error (falling back to regex):", error);
     return [];
   }
+}
+
+function isNonPersonalGeography(detection: AIDetection): boolean {
+  const value = detection.value.trim().toLowerCase();
+  const type = detection.type.trim().toLowerCase();
+  const label = detection.label.trim().toLowerCase();
+  const geographyTerms = new Set([
+    "china",
+    "russia",
+    "middle east",
+    "asia",
+    "europe",
+    "africa",
+    "north america",
+    "south america",
+    "australia",
+  ]);
+
+  if (geographyTerms.has(value)) return true;
+  if ((type.includes("country") || type.includes("region")) && !/\d/.test(value)) {
+    return true;
+  }
+  if ((label.includes("country") || label.includes("region")) && !/\d/.test(value)) {
+    return true;
+  }
+
+  return false;
 }

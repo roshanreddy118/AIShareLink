@@ -42,11 +42,10 @@ export async function POST(request: NextRequest) {
       extractionMethod = "direct";
     }
 
-    // Run regex and AI detection in parallel
-    const [regexMatches, aiMatches] = await Promise.all([
-      Promise.resolve(detectPII(text)),
-      detectPIIWithAI(text),
-    ]);
+    const regexMatches = detectPII(text);
+    const aiMatches = fileType.startsWith("image/")
+      ? []
+      : await detectPIIWithAI(text);
 
     // Merge and deduplicate (AI matches that overlap with regex are skipped)
     const matches: PIIMatch[] = [...regexMatches];
